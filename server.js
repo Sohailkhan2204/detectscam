@@ -1,7 +1,7 @@
 // ============================================
 // FRAUD DETECTION WEBHOOK SERVER
 // npm install express ws
-// node server.js
+// npm start / node server.js
 // ============================================
 
 const express = require('express');
@@ -11,12 +11,18 @@ const WebSocket = require('ws');
 const app = express();
 app.use(express.json());
 
+// Create HTTP server
 const server = http.createServer(app);
+
+// Create WebSocket server
 const wss = new WebSocket.Server({ server });
 
+// Store connected mobile apps
 const connectedApps = new Set();
 
-// Mobile app connects via WebSocket
+// ============================================
+// WEBSOCKET CONNECTION (Mobile App)
+// ============================================
 wss.on('connection', (ws) => {
     console.log('📱 Mobile app connected');
     connectedApps.add(ws);
@@ -27,7 +33,7 @@ wss.on('connection', (ws) => {
     });
 });
 
-// Broadcast alerts
+// Broadcast alerts to all connected apps
 function sendAlertToApps(event) {
     connectedApps.forEach(ws => {
         if (ws.readyState === WebSocket.OPEN) {
@@ -43,7 +49,7 @@ app.post('/vapi-webhook', (req, res) => {
     const message = req.body.message;
     console.log('📥 Vapi Event:', message?.type);
 
-    // 1️⃣ Transcript fraud detection
+    // 1️⃣ Transcript-based fraud detection
     if (message?.type === 'transcript') {
         const transcript = (message.transcript || '').toLowerCase();
 
@@ -55,7 +61,9 @@ app.post('/vapi-webhook', (req, res) => {
             'गिरफ्तार', 'ब्लॉक', 'केवाईसी', 'पैसे भेजो'
         ];
 
-        const detected = fraudKeywords.filter(k => transcript.includes(k));
+        const detected = fraudKeywords.filter(keyword =>
+            transcript.includes(keyword)
+        );
 
         if (detected.length > 0) {
             console.log('🚨 FRAUD DETECTED:', detected);
@@ -66,12 +74,13 @@ app.post('/vapi-webhook', (req, res) => {
                 keywords: detected,
                 transcript: message.transcript,
                 callId: message.call?.id,
+                confidence: Math.min(95, detected.length * 30),
                 timestamp: Date.now()
             });
         }
     }
 
-    // 2️⃣ Tool call logging (honeypot intelligence)
+    // 2️⃣ Honeypot tool-call logging
     if (message?.type === 'tool-calls') {
         const toolCall = message.toolCallList?.[0];
 
@@ -81,7 +90,8 @@ app.post('/vapi-webhook', (req, res) => {
             sendAlertToApps({
                 type: 'SCAM_DATA_CAPTURED',
                 data: toolCall.function.arguments,
-                callId: message.call?.id
+                callId: message.call?.id,
+                timestamp: Date.now()
             });
 
             return res.json({
@@ -99,7 +109,7 @@ app.post('/vapi-webhook', (req, res) => {
 });
 
 // ============================================
-// TEST ALERT (for demo)
+// TEST ALERT ENDPOINT (DEMO)
 // ============================================
 app.post('/test-alert', (req, res) => {
     sendAlertToApps({
@@ -107,15 +117,31 @@ app.post('/test-alert', (req, res) => {
         severity: 'HIGH',
         keywords: ['otp', 'kyc'],
         transcript: 'Test: Please share your OTP for KYC',
+        confidence: 90,
         timestamp: Date.now()
     });
 
     res.json({ sent: true });
 });
 
-const PORT = 3000;
+// ============================================
+// HEALTH CHECK (Render / Judges)
+// ============================================
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        activeConnections: connectedApps.size,
+        timestamp: Date.now()
+    });
+});
+
+// ============================================
+// START SERVER (Render-safe)
+// ============================================
+const PORT = process.env.PORT || 3000;
+
 server.listen(PORT, () => {
     console.log(`🛡️ Server running on port ${PORT}`);
-    console.log(`Webhook: http://localhost:${PORT}/vapi-webhook`);
-    console.log(`WebSocket: ws://localhost:${PORT}`);
+    console.log(`Webhook: /vapi-webhook`);
+    console.log(`WebSocket: wss://<your-render-url>`);
 });

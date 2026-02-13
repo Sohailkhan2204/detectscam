@@ -17,6 +17,9 @@ const wss = new WebSocket.Server({ server });
 const connectedApps = new Set();
 const fraudTriggeredCalls = new Set();
 
+// 🔒 Buffer FRAUD_ALERT per call (prevents wrong replay)
+const lastFraudAlertByCall = new Map(); // callId -> { event, ts }
+
 // -------------------- Fraud Keywords --------------------
 const fraudKeywords = [
   'otp', 'one time password', 'pin', 'cvv', 'password',
@@ -37,11 +40,19 @@ wss.on('connection', (ws) => {
   console.log('📱 Mobile app connected');
   connectedApps.add(ws);
 
-  ws.isAlive = true;
+  // ♻️ Replay recent FRAUD_ALERTs (last 2 min)
+  const now = Date.now();
+  for (const { event, ts } of lastFraudAlertByCall.values()) {
+    if (now - ts < 2 * 60 * 1000) {
+      try {
+        ws.send(JSON.stringify({ ...event, replay: true }));
+        console.log('♻️ Replayed FRAUD_ALERT for call', event.callId);
+      } catch {}
+    }
+  }
 
-  ws.on('pong', () => {
-    ws.isAlive = true;
-  });
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('close', () => {
     connectedApps.delete(ws);
@@ -51,19 +62,38 @@ wss.on('connection', (ws) => {
   ws.on('error', (e) => {
     console.log('⚠️ WS error:', e?.message);
   });
+
+  console.log('Active connections:', connectedApps.size);
 });
 
-// Keep WebSocket alive (important on Render)
+// Keep WebSocket alive (Render-safe)
 setInterval(() => {
-  wss.clients.forEach((ws) => {
+  wss.clients.forEach(ws => {
     if (ws.isAlive === false) return ws.terminate();
     ws.isAlive = false;
     try { ws.ping(); } catch {}
   });
 }, 20000);
 
+// Cleanup old buffered alerts (TTL safety)
+setInterval(() => {
+  const now = Date.now();
+  for (const [callId, { ts }] of lastFraudAlertByCall.entries()) {
+    if (now - ts > 2 * 60 * 1000) {
+      lastFraudAlertByCall.delete(callId);
+    }
+  }
+}, 30000);
+
 // Broadcast helper
 function sendToApps(event) {
+  if (event.type === 'FRAUD_ALERT' && event.callId) {
+    lastFraudAlertByCall.set(event.callId, {
+      event,
+      ts: Date.now()
+    });
+  }
+
   const payload = JSON.stringify(event);
   let sent = 0;
 
@@ -81,15 +111,11 @@ function sendToApps(event) {
 // VAPI WEBHOOK
 // ============================================
 app.post('/vapi-webhook', (req, res) => {
-  // Be resilient to payload shapes
   let message = req.body?.message || req.body;
-
-  // Vapi (or proxies) can sometimes send arrays/batches
   if (Array.isArray(message)) message = message[0];
 
   if (!message?.type) {
-    console.log('⚠️ Webhook ignored (no type). Body keys:', Object.keys(req.body || {}));
-    // IMPORTANT: return 200 so Vapi doesn't mark webhook unhealthy
+    console.log('⚠️ Webhook ignored (no type)');
     return res.status(200).json({ ignored: true });
   }
 
@@ -107,7 +133,9 @@ app.post('/vapi-webhook', (req, res) => {
     if (detected.length > 0 && !fraudTriggeredCalls.has(callId)) {
       fraudTriggeredCalls.add(callId);
 
-      console.log(`🚨 FRAUD DETECTED (${transcriptType}) callId=${callId} kws=${detected.join(',')}`);
+      console.log(
+        `🚨 FRAUD DETECTED (${transcriptType}) callId=${callId} kws=${detected.join(',')}`
+      );
 
       sendToApps({
         type: 'FRAUD_ALERT',
@@ -148,7 +176,7 @@ app.post('/vapi-webhook', (req, res) => {
     }
   }
 
-  // -------- Call lifecycle (optional but useful) --------
+  // -------- Call lifecycle --------
   if (message.type === 'status-update') {
     sendToApps({
       type: 'CALL_STATUS',
@@ -159,6 +187,7 @@ app.post('/vapi-webhook', (req, res) => {
 
     if (message.status === 'ended' && message.call?.id) {
       fraudTriggeredCalls.delete(message.call.id);
+      lastFraudAlertByCall.delete(message.call.id);
     }
   }
 
@@ -172,7 +201,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     activeConnections: connectedApps.size,
-    alertedCalls: fraudTriggeredCalls.size,
+    bufferedAlerts: lastFraudAlertByCall.size,
     timestamp: Date.now()
   });
 });

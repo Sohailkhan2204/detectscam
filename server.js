@@ -1,7 +1,5 @@
 // ============================================
-// FRAUD DETECTION WEBHOOK SERVER
-// npm install express ws
-// npm start / node server.js
+// REAL-TIME FRAUD DETECTION SERVER (Render-ready)
 // ============================================
 
 const express = require('express');
@@ -9,139 +7,180 @@ const http = require('http');
 const WebSocket = require('ws');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
-// Create HTTP server
 const server = http.createServer(app);
-
-// Create WebSocket server
 const wss = new WebSocket.Server({ server });
 
-// Store connected mobile apps
+// -------------------- State --------------------
 const connectedApps = new Set();
+const fraudTriggeredCalls = new Set();
+
+// -------------------- Fraud Keywords --------------------
+// Lowercase ONCE for safety
+const fraudKeywords = [
+  'otp', 'one time password', 'pin', 'cvv', 'password',
+  'kyc', 'account blocked', 'blocked', 'suspended',
+  'pay now', 'transfer', 'send money', 'upi',
+  'verify your account',
+  'arrest', 'police', 'cbi', 'income tax', 'legal action',
+  'anydesk', 'teamviewer',
+
+  // Hindi / Hinglish
+  'गिरफ्तार', 'केवाईसी', 'ब्लॉक', 'पैसे भेजो',
+  'ओटीपी', 'पिन'
+].map(k => k.toLowerCase());
 
 // ============================================
-// WEBSOCKET CONNECTION (Mobile App)
+// WebSocket: Mobile App (ALERT SOCKET)
 // ============================================
 wss.on('connection', (ws) => {
-    console.log('📱 Mobile app connected');
-    connectedApps.add(ws);
+  console.log('📱 Mobile app connected');
+  connectedApps.add(ws);
 
-    ws.on('close', () => {
-        connectedApps.delete(ws);
-        console.log('📴 Mobile app disconnected');
-    });
+  ws.isAlive = true;
+
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+
+  ws.on('close', () => {
+    connectedApps.delete(ws);
+    console.log('📴 Mobile app disconnected');
+  });
+
+  ws.on('error', (e) => {
+    console.log('⚠️ WS error:', e.message);
+  });
 });
 
-// Broadcast alerts to all connected apps
-function sendAlertToApps(event) {
-    connectedApps.forEach(ws => {
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(event));
-        }
-    });
+// Keep WebSocket alive (important on Render)
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  });
+}, 20000);
+
+// Broadcast helper
+function sendToApps(event) {
+  const payload = JSON.stringify(event);
+  let sent = 0;
+
+  for (const ws of connectedApps) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(payload);
+      sent++;
+    }
+  }
+
+  console.log(`➡️ Sent ${event.type} to ${sent} app(s) (active=${connectedApps.size})`);
 }
 
 // ============================================
-// VAPI WEBHOOK ENDPOINT
+// VAPI WEBHOOK
 // ============================================
 app.post('/vapi-webhook', (req, res) => {
-    const message = req.body.message;
-    console.log('📥 Vapi Event:', message?.type);
+  const message = req.body?.message || req.body;
 
-    // 1️⃣ Transcript-based fraud detection
-    if (message?.type === 'transcript') {
-        const transcript = (message.transcript || '').toLowerCase();
+  if (!message?.type) {
+    return res.status(400).json({ error: 'Missing message.type' });
+  }
 
-        const fraudKeywords = [
-            'otp', 'pin', 'cvv', 'password', 'blocked', 'suspended',
-            'arrest', 'police', 'legal action', 'pay now', 'transfer',
-            'kyc', 'verify', 'lottery', 'prize', 'winner',
-            'anydesk', 'teamviewer',
-            'गिरफ्तार', 'ब्लॉक', 'केवाईसी', 'पैसे भेजो'
-        ];
+  console.log('📥 Vapi Event:', message.type);
 
-        const detected = fraudKeywords.filter(keyword =>
-            transcript.includes(keyword)
-        );
+  // -------- Transcript (FAST detection) --------
+  if (message.type === 'transcript') {
+    const raw = message.transcript || '';
+    const text = raw.toLowerCase();
+    const callId = message.call?.id || message.callId || 'unknown';
+    const transcriptType = message.transcriptType || 'unknown';
 
-        if (detected.length > 0) {
-            console.log('🚨 FRAUD DETECTED:', detected);
+    const detected = fraudKeywords.filter(k => text.includes(k));
 
-            sendAlertToApps({
-                type: 'FRAUD_ALERT',
-                severity: detected.length >= 2 ? 'HIGH' : 'MEDIUM',
-                keywords: detected,
-                transcript: message.transcript,
-                callId: message.call?.id,
-                confidence: Math.min(95, detected.length * 30),
-                timestamp: Date.now()
-            });
-        }
-    }
+    if (detected.length > 0 && !fraudTriggeredCalls.has(callId)) {
+      fraudTriggeredCalls.add(callId);
 
-    // 2️⃣ Honeypot tool-call logging
-    if (message?.type === 'tool-calls') {
-        const toolCall = message.toolCallList?.[0];
+      console.log(`🚨 FRAUD DETECTED (${transcriptType}) callId=${callId}`);
 
-        if (toolCall?.function?.name === 'log_scam_data') {
-            console.log('📝 SCAM DATA:', toolCall.function.arguments);
-
-            sendAlertToApps({
-                type: 'SCAM_DATA_CAPTURED',
-                data: toolCall.function.arguments,
-                callId: message.call?.id,
-                timestamp: Date.now()
-            });
-
-            return res.json({
-                results: [
-                    {
-                        toolCallId: toolCall.id,
-                        result: 'Logged'
-                    }
-                ]
-            });
-        }
-    }
-
-    res.json({ success: true });
-});
-
-// ============================================
-// TEST ALERT ENDPOINT (DEMO)
-// ============================================
-app.post('/test-alert', (req, res) => {
-    sendAlertToApps({
+      sendToApps({
         type: 'FRAUD_ALERT',
-        severity: 'HIGH',
-        keywords: ['otp', 'kyc'],
-        transcript: 'Test: Please share your OTP for KYC',
-        confidence: 90,
+        severity: detected.length >= 2 ? 'HIGH' : 'MEDIUM',
+        keywords: [...new Set(detected)],
+        transcript: raw,
+        transcriptType,
+        callId,
+        confidence: Math.min(95, detected.length * 30),
         timestamp: Date.now()
+      });
+    }
+  }
+
+  // -------- Tool calls (scam intel) --------
+  if (message.type === 'tool-calls') {
+    const toolCall = message.toolCallList?.[0];
+    const callId = message.call?.id || 'unknown';
+
+    if (toolCall?.function?.name === 'log_scam_data') {
+      let args = toolCall.function.arguments;
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args); } catch {}
+      }
+
+      console.log('📝 SCAM DATA:', args);
+
+      sendToApps({
+        type: 'SCAM_DATA_CAPTURED',
+        data: args,
+        callId,
+        timestamp: Date.now()
+      });
+
+      return res.json({
+        results: [
+          { toolCallId: toolCall.id, result: 'Logged' }
+        ]
+      });
+    }
+  }
+
+  // -------- Call lifecycle (optional but useful) --------
+  if (message.type === 'status-update') {
+    sendToApps({
+      type: 'CALL_STATUS',
+      status: message.status,
+      callId: message.call?.id,
+      timestamp: Date.now()
     });
 
-    res.json({ sent: true });
+    if (message.status === 'ended' && message.call?.id) {
+      fraudTriggeredCalls.delete(message.call.id);
+    }
+  }
+
+  return res.json({ success: true });
 });
 
 // ============================================
-// HEALTH CHECK (Render / Judges)
+// Health Check
 // ============================================
 app.get('/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        activeConnections: connectedApps.size,
-        timestamp: Date.now()
-    });
+  res.json({
+    status: 'ok',
+    activeConnections: connectedApps.size,
+    alertedCalls: fraudTriggeredCalls.size,
+    timestamp: Date.now()
+  });
 });
 
 // ============================================
-// START SERVER (Render-safe)
+// Start Server (Render-safe)
 // ============================================
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 server.listen(PORT, () => {
-    console.log(`🛡️ Server running on port ${PORT}`);
-    console.log(`Webhook: /vapi-webhook`);
-    console.log(`WebSocket: wss://<your-render-url>`);
+  console.log(`🛡️ Server running on port ${PORT}`);
+  console.log(`Webhook: POST /vapi-webhook`);
+  console.log(`WS: wss://<your-render-url>`);
 });

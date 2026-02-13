@@ -8,6 +8,7 @@ const WebSocket = require('ws');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
@@ -17,7 +18,6 @@ const connectedApps = new Set();
 const fraudTriggeredCalls = new Set();
 
 // -------------------- Fraud Keywords --------------------
-// Lowercase ONCE for safety
 const fraudKeywords = [
   'otp', 'one time password', 'pin', 'cvv', 'password',
   'kyc', 'account blocked', 'blocked', 'suspended',
@@ -25,7 +25,6 @@ const fraudKeywords = [
   'verify your account',
   'arrest', 'police', 'cbi', 'income tax', 'legal action',
   'anydesk', 'teamviewer',
-
   // Hindi / Hinglish
   'गिरफ्तार', 'केवाईसी', 'ब्लॉक', 'पैसे भेजो',
   'ओटीपी', 'पिन'
@@ -50,7 +49,7 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('error', (e) => {
-    console.log('⚠️ WS error:', e.message);
+    console.log('⚠️ WS error:', e?.message);
   });
 });
 
@@ -82,10 +81,16 @@ function sendToApps(event) {
 // VAPI WEBHOOK
 // ============================================
 app.post('/vapi-webhook', (req, res) => {
-  const message = req.body?.message || req.body;
+  // Be resilient to payload shapes
+  let message = req.body?.message || req.body;
+
+  // Vapi (or proxies) can sometimes send arrays/batches
+  if (Array.isArray(message)) message = message[0];
 
   if (!message?.type) {
-    return res.status(400).json({ error: 'Missing message.type' });
+    console.log('⚠️ Webhook ignored (no type). Body keys:', Object.keys(req.body || {}));
+    // IMPORTANT: return 200 so Vapi doesn't mark webhook unhealthy
+    return res.status(200).json({ ignored: true });
   }
 
   console.log('📥 Vapi Event:', message.type);
@@ -102,7 +107,7 @@ app.post('/vapi-webhook', (req, res) => {
     if (detected.length > 0 && !fraudTriggeredCalls.has(callId)) {
       fraudTriggeredCalls.add(callId);
 
-      console.log(`🚨 FRAUD DETECTED (${transcriptType}) callId=${callId}`);
+      console.log(`🚨 FRAUD DETECTED (${transcriptType}) callId=${callId} kws=${detected.join(',')}`);
 
       sendToApps({
         type: 'FRAUD_ALERT',
@@ -138,9 +143,7 @@ app.post('/vapi-webhook', (req, res) => {
       });
 
       return res.json({
-        results: [
-          { toolCallId: toolCall.id, result: 'Logged' }
-        ]
+        results: [{ toolCallId: toolCall.id, result: 'Logged' }]
       });
     }
   }
@@ -181,6 +184,6 @@ const PORT = process.env.PORT || 10000;
 
 server.listen(PORT, () => {
   console.log(`🛡️ Server running on port ${PORT}`);
-  console.log(`Webhook: POST /vapi-webhook`);
-  console.log(`WS: wss://<your-render-url>`);
+  console.log('Webhook: POST /vapi-webhook');
+  console.log('WS: wss://<your-render-url>');
 });
